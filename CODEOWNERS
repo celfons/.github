@@ -1,0 +1,4 @@
+# CODEOWNERS
+# All changes to this repository require review from the security team.
+
+* @celfons/security
