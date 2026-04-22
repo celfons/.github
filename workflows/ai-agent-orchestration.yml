@@ -1,0 +1,593 @@
+name: AI Agent Orchestration
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trigger on issue events.
+#   • opened  → runs Job 1 (Triage) then Job 2 (Planner)
+#   • labeled → runs Job 3 (Executor) only when the label is 'ai-approved'
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  issues:
+    types: [opened, labeled]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 1 — Triage
+# Uses gpt-4o-mini to identify relevant context-mesh files for the issue.
+# Outputs: context_files (JSON array of relative file paths)
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  triage:
+    name: "Job 1 — Triage"
+    if: github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    outputs:
+      context_files: ${{ steps.identify.outputs.context_files }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trim issue body to 4000 tokens
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          printf '%s' "$ISSUE_BODY" \
+            | python3 context-mesh/scripts/trim-context.py > /tmp/trimmed-issue.txt
+
+      - name: Identify relevant context files
+        id: identify
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is not configured."
+            exit 1
+          fi
+
+          # Build list of available context files
+          # Cap at 30 files to stay well within prompt token budget
+          find context-mesh -type f -name "*.md" | sort | head -30 > /tmp/available-files.txt
+
+          # Build OpenAI payload
+          cat > /tmp/build-triage-payload.py << 'PYEOF'
+          import json, os
+
+          with open('/tmp/available-files.txt') as f:
+              files = [l.strip() for l in f if l.strip()]
+
+          with open('/tmp/trimmed-issue.txt') as f:
+              body = f.read()
+
+          payload = {
+              "model": "gpt-4o-mini",
+              "max_tokens": 300,
+              "temperature": 0,
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a triage agent. Given a GitHub issue, select the most relevant "
+                          "context files from the provided list. Reply ONLY with a valid JSON array "
+                          "of file paths, e.g. [\"context-mesh/knowledge-base.md\"]. "
+                          "Return an empty array [] if none are relevant. No explanation."
+                      )
+                  },
+                  {
+                      "role": "user",
+                      "content": (
+                          f"Issue title: {os.environ['ISSUE_TITLE']}\n\n"
+                          f"Issue body:\n{body}\n\n"
+                          f"Available context files:\n" + "\n".join(files)
+                      )
+                  }
+              ]
+          }
+
+          with open('/tmp/triage-payload.json', 'w') as f:
+              json.dump(payload, f)
+          PYEOF
+          python3 /tmp/build-triage-payload.py
+
+          # Call OpenAI API (response saved directly to file to preserve special chars)
+          curl -sf https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            --data @/tmp/triage-payload.json \
+            -o /tmp/triage-response.json
+
+          # Extract and validate JSON array from response
+          python3 << 'PYEOF'
+          import json, os, sys
+
+          with open('/tmp/triage-response.json') as f:
+              data = json.load(f)
+
+          if 'error' in data:
+              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              sys.exit(1)
+
+          content = data['choices'][0]['message']['content'].strip()
+
+          try:
+              parsed = json.loads(content)
+              result = parsed if isinstance(parsed, list) else []
+          except json.JSONDecodeError:
+              result = []
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"context_files={json.dumps(result)}\n")
+
+          print(f"Identified {len(result)} context file(s): {result}")
+          PYEOF
+
+      - name: Ensure triage-done label exists and apply it
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const label = 'triage-done';
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({ owner, repo, name: label, color: 'f59e0b' });
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo,
+              issue_number: context.payload.issue.number,
+              labels: [label],
+            });
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 2 — Planner
+# Reads context files identified by Triage, generates a Markdown action plan
+# via gpt-4o-mini, and posts it as a comment on the issue.
+# ──────────────────────────────────────────────────────────────────────────────
+  planner:
+    name: "Job 2 — Planner"
+    needs: triage
+    if: github.event.action == 'opened' && needs.triage.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read and trim relevant context files
+        env:
+          CONTEXT_FILES: ${{ needs.triage.outputs.context_files }}
+        run: |
+          cat > /tmp/read-context.py << 'PYEOF'
+          import json, os
+
+          files = json.loads(os.environ.get('CONTEXT_FILES', '[]'))
+          chunks = []
+          for path in files:
+              if os.path.isfile(path):
+                  with open(path) as f:
+                      chunks.append(f"### {path}\n\n{f.read()}")
+
+          combined = "\n\n---\n\n".join(chunks)
+          with open('/tmp/context-content.txt', 'w') as f:
+              f.write(combined)
+
+          print(f"Loaded {len(chunks)} context file(s)")
+          PYEOF
+          python3 /tmp/read-context.py
+
+          # Trim to 3000 tokens to leave room for issue body in the prompt
+          python3 context-mesh/scripts/trim-context.py \
+            /tmp/context-content.txt --max-tokens 3000 > /tmp/trimmed-context.txt
+
+      - name: Trim issue body to 1500 tokens
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          printf '%s' "$ISSUE_BODY" \
+            | python3 context-mesh/scripts/trim-context.py --max-tokens 1500 > /tmp/trimmed-issue.txt
+
+      - name: Generate action plan via gpt-4o-mini
+        id: generate-plan
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is not configured."
+            exit 1
+          fi
+
+          cat > /tmp/build-plan-payload.py << 'PYEOF'
+          import json, os
+
+          with open('/tmp/trimmed-issue.txt') as f:
+              body = f.read()
+
+          with open('/tmp/trimmed-context.txt') as f:
+              ctx = f.read()
+
+          context_section = f"\n\nRelevant context:\n{ctx}" if ctx.strip() else ""
+
+          payload = {
+              "model": "gpt-4o-mini",
+              "max_tokens": 1500,
+              "temperature": 0.2,
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a planning agent for a GitHub repository. "
+                          "Generate a concise, actionable Markdown action plan to resolve the given issue. "
+                          "Structure: 1) Problem Summary, 2) Proposed Solution Steps, "
+                          "3) Files to Create/Modify, 4) Acceptance Criteria."
+                      )
+                  },
+                  {
+                      "role": "user",
+                      "content": (
+                          f"Issue #{os.environ['ISSUE_NUMBER']}: {os.environ['ISSUE_TITLE']}\n\n"
+                          f"Issue body:\n{body}"
+                          + context_section
+                      )
+                  }
+              ]
+          }
+
+          with open('/tmp/plan-payload.json', 'w') as f:
+              json.dump(payload, f)
+          PYEOF
+          python3 /tmp/build-plan-payload.py
+
+          curl -sf https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            --data @/tmp/plan-payload.json \
+            -o /tmp/plan-response.json
+
+          python3 << 'PYEOF'
+          import json, sys
+
+          with open('/tmp/plan-response.json') as f:
+              data = json.load(f)
+
+          if 'error' in data:
+              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              sys.exit(1)
+
+          plan = data['choices'][0]['message']['content'].strip()
+          with open('/tmp/generated-plan.txt', 'w') as f:
+              f.write(plan)
+
+          print(f"Plan generated ({len(plan)} chars)")
+          PYEOF
+
+      - name: Post action plan as issue comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('/tmp/generated-plan.txt', 'utf8');
+
+            const body = [
+              '## 🤖 AI Agent Action Plan',
+              '',
+              '> Auto-generated by the Triage + Planner pipeline.',
+              '> Add the `ai-approved` label to trigger the Executor and open a PR.',
+              '',
+              '<!-- ai-agent-plan-start -->',
+              plan,
+              '<!-- ai-agent-plan-end -->',
+              '',
+              '---',
+              '_Generated by the [AI Agent Orchestration](../actions/workflows/ai-agent-orchestration.yml) workflow_',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body,
+            });
+
+      - name: Ensure plan-ready label exists and apply it
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const label = 'plan-ready';
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({ owner, repo, name: label, color: '3b82f6' });
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo,
+              issue_number: context.payload.issue.number,
+              labels: [label],
+            });
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 3 — Executor
+# Triggered ONLY when the 'ai-approved' label is added AND 'plan-ready' is
+# already present on the issue. Reads the plan from the issue comment,
+# calls gpt-4o to produce file changes, and opens a Pull Request.
+# ──────────────────────────────────────────────────────────────────────────────
+  executor:
+    name: "Job 3 — Executor"
+    if: >-
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ai-approved' &&
+      contains(github.event.issue.labels.*.name, 'plan-ready')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure executing label exists and apply it
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const label = 'executing';
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({ owner, repo, name: label, color: '8b5cf6' });
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo,
+              issue_number: context.payload.issue.number,
+              labels: [label],
+            });
+
+      - name: Retrieve action plan from issue comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issueNumber = context.payload.issue.number;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const planComments = comments.filter(c =>
+              c.body.includes('<!-- ai-agent-plan-start -->')
+            );
+
+            if (planComments.length === 0) {
+              core.setFailed(
+                'No action plan comment found. Run triage and planner first.'
+              );
+              return;
+            }
+
+            const latest = planComments[planComments.length - 1];
+            const match = latest.body.match(
+              /<!-- ai-agent-plan-start -->([\s\S]*?)<!-- ai-agent-plan-end -->/
+            );
+            const planContent = match ? match[1].trim() : latest.body;
+
+            fs.writeFileSync('/tmp/retrieved-plan.txt', planContent);
+            core.info(`Plan retrieved from comment #${latest.id}`);
+
+      - name: Trim inputs for executor
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python3 context-mesh/scripts/trim-context.py \
+            /tmp/retrieved-plan.txt --max-tokens 2500 > /tmp/trimmed-plan.txt
+          printf '%s' "$ISSUE_BODY" \
+            | python3 context-mesh/scripts/trim-context.py --max-tokens 1500 > /tmp/trimmed-issue.txt
+
+      - name: Generate solution via gpt-4o
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is not configured."
+            exit 1
+          fi
+
+          cat > /tmp/build-executor-payload.py << 'PYEOF'
+          import json, os
+
+          with open('/tmp/trimmed-plan.txt') as f:
+              plan = f.read()
+
+          with open('/tmp/trimmed-issue.txt') as f:
+              body = f.read()
+
+          payload = {
+              "model": "gpt-4o",
+              "max_tokens": 2000,
+              "temperature": 0.1,
+              "response_format": {"type": "json_object"},
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are an execution agent. Based on the action plan, generate concrete "
+                          "file changes to resolve the GitHub issue. "
+                          "Reply ONLY with a valid JSON object: "
+                          "{\"changes\": [{\"file_path\": \"...\", \"action\": \"create|update|delete\", \"content\": \"...\"}]}. "
+                          "For delete actions, set content to an empty string. "
+                          "Use relative file paths from the repository root."
+                      )
+                  },
+                  {
+                      "role": "user",
+                      "content": (
+                          f"Issue #{os.environ['ISSUE_NUMBER']}: {os.environ['ISSUE_TITLE']}\n\n"
+                          f"Issue body:\n{body}\n\n"
+                          f"Action plan:\n{plan}"
+                      )
+                  }
+              ]
+          }
+
+          with open('/tmp/executor-payload.json', 'w') as f:
+              json.dump(payload, f)
+          PYEOF
+          python3 /tmp/build-executor-payload.py
+
+          curl -sf https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            --data @/tmp/executor-payload.json \
+            -o /tmp/executor-response.json
+
+          python3 << 'PYEOF'
+          import json, sys
+
+          with open('/tmp/executor-response.json') as f:
+              data = json.load(f)
+
+          if 'error' in data:
+              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              sys.exit(1)
+
+          raw = data['choices'][0]['message']['content']
+          try:
+              parsed = json.loads(raw)
+              changes = parsed.get('changes', [])
+          except json.JSONDecodeError as e:
+              print(f"::error::Could not parse solution JSON: {e}")
+              changes = []
+
+          with open('/tmp/solution-changes.json', 'w') as f:
+              json.dump(changes, f)
+
+          print(f"Solution: {len(changes)} file change(s) planned")
+          PYEOF
+
+      - name: Apply changes and open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
+
+            const issueNumber = process.env.ISSUE_NUMBER;
+            const issueTitle  = process.env.ISSUE_TITLE;
+
+            let changes = [];
+            try {
+              changes = JSON.parse(fs.readFileSync('/tmp/solution-changes.json', 'utf8'));
+            } catch (e) {
+              core.warning(`Could not read solution: ${e.message}`);
+            }
+
+            if (changes.length === 0) {
+              core.warning('No file changes generated. Skipping PR creation.');
+              return;
+            }
+
+            // Unique branch name to prevent collisions on repeated runs.
+            // Slice to 19 chars to get 'YYYY-MM-DDTHH-MM-SS' format.
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const branchName = `ai-agent/issue-${issueNumber}-${timestamp}`;
+
+            execSync('git config user.name "github-actions[bot]"');
+            execSync('git config user.email "github-actions[bot]@users.noreply.github.com"');
+            execSync(`git checkout -b ${branchName}`);
+
+            const workspace = process.cwd();
+
+            for (const change of changes) {
+              // Guard against path traversal: normalize then confirm the resolved
+              // path is still inside the workspace root (handles ../, %2e%2e, etc.)
+              if (!change.file_path) {
+                core.warning('Skipping change with empty file_path');
+                continue;
+              }
+              const resolved = path.resolve(workspace, change.file_path);
+              if (!resolved.startsWith(workspace + path.sep) && resolved !== workspace) {
+                core.warning(`Skipping path outside workspace: ${change.file_path}`);
+                continue;
+              }
+
+              if (change.action === 'delete') {
+                if (fs.existsSync(change.file_path)) {
+                  fs.unlinkSync(change.file_path);
+                  execSync(`git rm --force -- "${change.file_path}"`);
+                }
+              } else {
+                fs.mkdirSync(path.dirname(change.file_path), { recursive: true });
+                fs.writeFileSync(change.file_path, change.content || '');
+                execSync(`git add -- "${change.file_path}"`);
+              }
+            }
+
+            const staged = execSync('git diff --cached --name-only').toString().trim();
+            if (!staged) {
+              core.warning('No staged changes after applying solution. Skipping PR creation.');
+              return;
+            }
+
+            execSync(
+              `git commit -m "fix: resolve issue #${issueNumber} via AI agent\n\nCloses #${issueNumber}"`
+            );
+
+            const repoUrl = `https://x-access-token:${process.env.GH_TOKEN}@github.com/${context.repo.owner}/${context.repo.repo}`;
+            execSync(`git remote set-url origin ${repoUrl}`);
+            execSync(`git push origin ${branchName}`);
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `fix: ${issueTitle}`,
+              body: [
+                '## 🤖 AI-Generated Solution',
+                '',
+                'This pull request was generated by the AI Agent Orchestration workflow.',
+                '',
+                `Closes #${issueNumber}`,
+                '',
+                '> ⚠️ Review carefully before merging. AI-generated code may contain errors.',
+              ].join('\n'),
+              head: branchName,
+              base: context.payload.repository.default_branch,
+            });
+
+            core.info(`PR created: ${pr.data.html_url}`);
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(issueNumber),
+              body: `## 🤖 Pull Request Created\n\nThe AI agent has opened a solution PR: ${pr.data.html_url}\n\n> Review carefully before merging.`,
+            });
