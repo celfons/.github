@@ -63,6 +63,50 @@ Issue opened (via API)
   → Optional PR in this repository to add or update a rule in SECURITY/RULES/
 ```
 
+```mermaid
+flowchart TD
+    A([Aikido SAST Scan]) --> B([Jira])
+    B --> C([GitHub API])
+    C --> D[Issue opened in .github]
+
+    D --> E[enrich-sast-issue.yml]
+    E --> E1[Adds labels:\nagent, agent:security,\nsast, tool:aikido]
+    E1 --> E2[Pins enrichment comment\nwith execution context]
+    E2 --> E3[Adds label: agent:ready]
+
+    E3 --> F[ai-agent-orchestration.yml\nJob 1 — Triage]
+    F --> F1[gpt-4o-mini identifies\nrelevant context-mesh files]
+    F1 --> F2[Adds label: triage-done]
+
+    F2 --> G[ai-agent-orchestration.yml\nJob 2 — Planner]
+    G --> G1[gpt-4o generates\naction plan]
+    G1 --> G2[Posts plan as comment\nai-agent-plan-start/end]
+    G2 --> G3[Adds label: plan-ready]
+
+    G3 --> H{Human Review}
+    H -->|Approves| H1[Adds label: ai-approved]
+    H -->|Rejects / requests changes| H2([End — plan revised\nor issue closed])
+
+    H1 --> I[ai-agent-orchestration.yml\nJob 3 — Executor]
+    I --> I1[GitHub Copilot agent\napplies the plan]
+    I1 --> I2[Opens PR on branch\nai-agent/issue-N-timestamp]
+    I2 --> I3[Adds label: executing]
+
+    I2 --> J[validate-agent-pr.yml]
+    J --> J1{PR references\nSAST issue?}
+    J1 -->|No| J2[Warning posted on PR]
+    J1 -->|Yes| J3[Validation passes]
+
+    I3 --> K{Human reviews\nPR in product repo}
+    K -->|Merges| L([Fix applied in\nproduct repository])
+    K -->|Requests changes| I1
+
+    L --> M{New rule\nneeded?}
+    M -->|Yes| N[PR to add/update rule\nin SECURITY/RULES/]
+    N --> O([Rule merged into\ngovernance repository])
+    M -->|No| P([Flow complete])
+```
+
 ---
 
 ## Label State Machine
