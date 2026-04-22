@@ -11,7 +11,7 @@ on:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Job 1 — Triage
-# Uses gpt-4o-mini to identify relevant context-mesh files for the issue.
+# Uses gpt-4o-mini (via GitHub Models) to identify relevant context-mesh files.
 # Outputs: context_files (JSON array of relative file paths)
 # ──────────────────────────────────────────────────────────────────────────────
 jobs:
@@ -38,19 +38,14 @@ jobs:
       - name: Identify relevant context files
         id: identify
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::OPENAI_API_KEY secret is not configured."
-            exit 1
-          fi
-
           # Build list of available context files
           # Cap at 30 files to stay well within prompt token budget
           find context-mesh -type f -name "*.md" | sort | head -30 > /tmp/available-files.txt
 
-          # Build OpenAI payload
+          # Build GitHub Models payload (OpenAI-compatible API)
           cat > /tmp/build-triage-payload.py << 'PYEOF'
           import json, os
 
@@ -90,10 +85,10 @@ jobs:
           PYEOF
           python3 /tmp/build-triage-payload.py
 
-          # Call OpenAI API (response saved directly to file to preserve special chars)
-          curl -sf https://api.openai.com/v1/chat/completions \
+          # Call GitHub Models API (response saved directly to file to preserve special chars)
+          curl -sf https://models.inference.ai.azure.com/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             --data @/tmp/triage-payload.json \
             -o /tmp/triage-response.json
 
@@ -105,7 +100,7 @@ jobs:
               data = json.load(f)
 
           if 'error' in data:
-              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              print(f"::error::GitHub Models API error: {data['error'].get('message', 'Unknown')}")
               sys.exit(1)
 
           content = data['choices'][0]['message']['content'].strip()
@@ -147,7 +142,7 @@ jobs:
 # ──────────────────────────────────────────────────────────────────────────────
 # Job 2 — Planner
 # Reads context files identified by Triage, generates a Markdown action plan
-# via gpt-4o-mini, and posts it as a comment on the issue.
+# via gpt-4o-mini (GitHub Models), and posts it as a comment on the issue.
 # ──────────────────────────────────────────────────────────────────────────────
   planner:
     name: "Job 2 — Planner"
@@ -197,15 +192,10 @@ jobs:
       - name: Generate action plan via gpt-4o-mini
         id: generate-plan
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::OPENAI_API_KEY secret is not configured."
-            exit 1
-          fi
-
           cat > /tmp/build-plan-payload.py << 'PYEOF'
           import json, os
 
@@ -247,9 +237,9 @@ jobs:
           PYEOF
           python3 /tmp/build-plan-payload.py
 
-          curl -sf https://api.openai.com/v1/chat/completions \
+          curl -sf https://models.inference.ai.azure.com/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             --data @/tmp/plan-payload.json \
             -o /tmp/plan-response.json
 
@@ -260,7 +250,7 @@ jobs:
               data = json.load(f)
 
           if 'error' in data:
-              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              print(f"::error::GitHub Models API error: {data['error'].get('message', 'Unknown')}")
               sys.exit(1)
 
           plan = data['choices'][0]['message']['content'].strip()
@@ -324,7 +314,7 @@ jobs:
 # Job 3 — Executor
 # Triggered ONLY when the 'ai-approved' label is added AND 'plan-ready' is
 # already present on the issue. Reads the plan from the issue comment,
-# calls gpt-4o to produce file changes, and opens a Pull Request.
+# calls gpt-4o (GitHub Models) to produce file changes, and opens a Pull Request.
 # ──────────────────────────────────────────────────────────────────────────────
   executor:
     name: "Job 3 — Executor"
@@ -408,15 +398,10 @@ jobs:
 
       - name: Generate solution via gpt-4o
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::OPENAI_API_KEY secret is not configured."
-            exit 1
-          fi
-
           cat > /tmp/build-executor-payload.py << 'PYEOF'
           import json, os
 
@@ -459,9 +444,9 @@ jobs:
           PYEOF
           python3 /tmp/build-executor-payload.py
 
-          curl -sf https://api.openai.com/v1/chat/completions \
+          curl -sf https://models.inference.ai.azure.com/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             --data @/tmp/executor-payload.json \
             -o /tmp/executor-response.json
 
@@ -472,7 +457,7 @@ jobs:
               data = json.load(f)
 
           if 'error' in data:
-              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              print(f"::error::GitHub Models API error: {data['error'].get('message', 'Unknown')}")
               sys.exit(1)
 
           raw = data['choices'][0]['message']['content']

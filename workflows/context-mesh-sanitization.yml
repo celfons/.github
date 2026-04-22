@@ -58,18 +58,13 @@ jobs:
             core.info(`Found ${summary.length} PR(s) merged in the past week`);
             core.setOutput('pr_count', String(summary.length));
 
-      # ── Step 2: Build updated knowledge base via gpt-4o ─────────────────────
+      # ── Step 2: Build updated knowledge base via gpt-4o (GitHub Models) ────────
       - name: Build updated knowledge base
         id: update-kb
         if: steps.fetch-prs.outputs.pr_count != '' && steps.fetch-prs.outputs.pr_count != '0'
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::OPENAI_API_KEY secret is not configured."
-            exit 1
-          fi
-
           # Trim current knowledge base to 3000 tokens
           python3 context-mesh/scripts/trim-context.py \
             context-mesh/knowledge-base.md --max-tokens 3000 > /tmp/trimmed-kb.txt
@@ -125,9 +120,9 @@ jobs:
           PYEOF
           python3 /tmp/build-sanitize-payload.py
 
-          curl -sf https://api.openai.com/v1/chat/completions \
+          curl -sf https://models.inference.ai.azure.com/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             --data @/tmp/sanitize-payload.json \
             -o /tmp/sanitize-response.json
 
@@ -138,7 +133,7 @@ jobs:
               data = json.load(f)
 
           if 'error' in data:
-              print(f"::error::OpenAI API error: {data['error'].get('message', 'Unknown')}")
+              print(f"::error::GitHub Models API error: {data['error'].get('message', 'Unknown')}")
               sys.exit(1)
 
           updated_kb = data['choices'][0]['message']['content'].strip()
